@@ -481,7 +481,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 // ─── Start Server ────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║         Google Forms MCP Server v1.1.0               ║
