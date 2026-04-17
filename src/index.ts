@@ -385,7 +385,7 @@ app.get("/health", (_req, res) => {
     status: "ok",
     authenticated: isAuthenticated(),
     server: "google-forms-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
     activeSessions: sessions.size,
   });
 });
@@ -412,18 +412,12 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-async function createSession(): Promise<{ session: Session; sessionId: string }> {
-  const server = new McpServer({ name: "google-forms", version: "1.1.0" });
-  registerTools(server);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  await server.connect(transport);
-  const sessionId = transport.sessionId!;
-  const session: Session = { transport, server, lastSeen: Date.now() };
-  sessions.set(sessionId, session);
-  console.error(`[MCP] New session: ${sessionId} (total: ${sessions.size})`);
-  return { session, sessionId };
+
+
+// Detect the MCP `initialize` request (first call in any session)
+function isInitializeRequest(body: any): boolean {
+  if (Array.isArray(body)) return body.some((b) => b?.method === "initialize");
+  return body?.method === "initialize";
 }
 
 app.post("/mcp", async (req: Request, res: Response) => {
@@ -431,16 +425,54 @@ app.post("/mcp", async (req: Request, res: Response) => {
     const headerSessionId = req.headers["mcp-session-id"] as string | undefined;
     let session = headerSessionId ? sessions.get(headerSessionId) : undefined;
 
-    if (!session) {
-      const result = await createSession();
-      session = result.session;
+    // Reuse existing session if the client sent a valid session ID
+    if (session) {
+      session.lastSeen = Date.now();
+      await session.transport.handleRequest(req, res, req.body);
+      return;
     }
-    session.lastSeen = Date.now();
-    await session.transport.handleRequest(req, res, req.body);
+
+    // Only create a new session on a real initialize request
+    if (!isInitializeRequest(req.body)) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: no valid session ID and not an initialize request" },
+        id: null,
+      });
+      return;
+    }
+
+    // Build a fresh server + transport pair; register the session only once
+    // the transport fires onsessioninitialized (i.e., after the SDK has
+    // processed the initialize message and minted a session ID).
+    const server = new McpServer({ name: "google-forms", version: "1.2.0" });
+    registerTools(server);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sessionId: string) => {
+        sessions.set(sessionId, { transport, server, lastSeen: Date.now() });
+        console.error(`[MCP] New session: ${sessionId} (total: ${sessions.size})`);
+      },
+    });
+
+    transport.onclose = () => {
+      if (transport.sessionId && sessions.has(transport.sessionId)) {
+        sessions.delete(transport.sessionId);
+        console.error(`[MCP] Transport closed, session removed: ${transport.sessionId}`);
+      }
+    };
+
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   } catch (err: any) {
     console.error("[MCP] POST error:", err);
     if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: err.message } });
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: err.message },
+        id: null,
+      });
     }
   }
 });
@@ -481,10 +513,10 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 // ─── Start Server ────────────────────────────────────────────────────────────
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.error(`
 ╔══════════════════════════════════════════════════════╗
-║         Google Forms MCP Server v1.1.0               ║
+║         Google Forms MCP Server v1.2.0               ║
 ╠══════════════════════════════════════════════════════╣
 ║  MCP Endpoint:  http://localhost:${PORT}/mcp
 ║  OAuth:         http://localhost:${PORT}/oauth/authorize
